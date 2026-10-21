@@ -224,6 +224,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     // Monotonic (performance.now) rather than the wall clock: a system-time jump must not turn
     // the storage-load report negative or huge.
     let t0 = web_time::Instant::now();
+    let primary = persist::claim_session().await;
     let stored = match persist::load(&query_value("storage").unwrap_or_default()).await {
         Ok(n) => n,
         Err(e) => {
@@ -274,7 +275,8 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                 session.load_settings();
                 // Scripts in Scripts/Startup run before a project opens.
                 let _ = session.execute("file.runStartupScripts", json!({}));
-                let recovery = session.begin_recovery();
+                // A second tab leaves the first tab's crash sentinel and session snapshot alone.
+                let recovery = if primary { session.begin_recovery() } else { None };
                 // `?empty`: a blank project; `?demo`: the demo project; otherwise what the config's
                 // `startup` says (default: the last visit's project, the demo on a first visit).
                 let demo = query_flag("demo");
@@ -288,6 +290,10 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                 let mut app = EffectcraftApp::new(session);
                 app.set_gpu_failure_bridge(gpu_failures);
                 app.ui.start_screen = home;
+                if !primary {
+                    app.ui.status =
+                        "EffectCraft is open in another tab: this tab does not save or restore the session, so reloading it starts fresh. Save projects with File ▸ Save.".into();
+                }
                 if let Some(r) = recovery.filter(|r| !restored && r.autosave.is_some()) {
                     app.offer_recovery(r);
                 }
