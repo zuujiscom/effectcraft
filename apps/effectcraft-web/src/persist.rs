@@ -45,6 +45,43 @@ thread_local! {
     static RETRY_PENDING: Cell<bool> = const { Cell::new(false) };
     static SNAP: Cell<(u64, f64)> = const { Cell::new((u64::MAX, 0.0)) };
     static LAST_META: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// This tab owns the session snapshot ([`claim_session`]).
+    static PRIMARY: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Whether this tab keeps the session snapshot: the snapshot is one entry per site, so a second
+/// tab writing it would replace the first tab's project, and would open the first tab's live
+/// project when it started.
+pub fn is_primary() -> bool {
+    PRIMARY.with(|p| p.get())
+}
+
+/// Take the site's session lock (a Web Lock held for the life of the page) → whether this tab got
+/// it. Browsers without Web Locks leave every tab primary, as before.
+pub async fn claim_session() -> bool {
+    let Some(locks) = web_sys::window().and_then(|w| js_sys::Reflect::get(&w.navigator(), &"locks".into()).ok()).filter(JsValue::is_object) else {
+        return true;
+    };
+    let Some(request) = js_sys::Reflect::get(&locks, &"request".into()).ok().and_then(|f| f.dyn_into::<js_sys::Function>().ok()) else {
+        return true;
+    };
+    let options = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&options, &"ifAvailable".into(), &true.into());
+    // The callback gets the lock, or null when another tab holds it. A lock stays held until the
+    // promise the callback returns settles: this one never does, so it lasts until the page goes.
+    let got = js_sys::Promise::new(&mut |resolve, _| {
+        let answer = resolve.clone();
+        let callback = Closure::once_into_js(move |lock: JsValue| {
+            let _ = answer.call1(&JsValue::NULL, &JsValue::from_bool(!lock.is_null()));
+            if lock.is_null() { js_sys::Promise::resolve(&JsValue::NULL) } else { js_sys::Promise::new(&mut |_, _| {}) }
+        });
+        if request.call3(&locks, &"effectcraft.session".into(), &options, &callback).is_err() {
+            let _ = resolve.call1(&JsValue::NULL, &JsValue::TRUE);
+        }
+    });
+    let primary = JsFuture::from(got).await.ok().and_then(|v| v.as_bool()).unwrap_or(true);
+    PRIMARY.with(|p| p.set(primary));
+    primary
 }
 
 const RETRY_FIRST_MS: i32 = 2_000;
@@ -186,6 +223,9 @@ pub fn config() -> WebConfig {
 /// Record the open project and editor state when they changed (checked at most every
 /// `min_secs`).
 pub fn snapshot(s: &Session, now: f64, min_secs: f64) {
+    if !is_primary() {
+        return;
+    }
     let (rev, at) = SNAP.with(|c| c.get());
     if now - at < min_secs {
         return;
@@ -207,6 +247,9 @@ pub fn snapshot(s: &Session, now: f64, min_secs: f64) {
 
 /// Reopen the last visit's project and editor state. Returns whether there was one.
 pub fn restore(s: &mut Session) -> bool {
+    if !is_primary() {
+        return false;
+    }
     let c = config();
     let (Some(json), Some(meta)) = (c.read(SNAPSHOT), c.read(SNAPSHOT_META)) else { return false };
     let meta: SnapshotMeta = serde_json::from_str(&meta).unwrap_or_default();
