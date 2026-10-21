@@ -88,6 +88,9 @@ fn fxn_median(@builtin(global_invocation_id) gid: vec3<u32>) {
 // leaving, add the one entering) and moves each channel's median by the counts below it.
 // u[0] = (r, segment length); dispatched over (rows, segments) with 64 × 1 workgroups.
 // data = the 512 CPU-rounded level / 511 values.
+// The histogram packs two 16-bit counts per u32 (bin i is the (i & 1) half of word i >> 1): a
+// count is at most (2r + 1)², which fits for r <= MEDIAN_HUANG_MAX_R (fx_noise.rs), and a plain
+// array<u32, 2048> is 8 KB, over WebKit's 8192-byte limit on a function's variables.
 @compute @workgroup_size(64, 1)
 fn fxn_median_huang(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -100,14 +103,14 @@ fn fxn_median_huang(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x1 = min(x0 + seg, dims.x);
     let r = i32(P.u[0].x);
     let half = u32((2 * r + 1) * (2 * r + 1) / 2);
-    var hist: array<u32, 2048>;
+    var hist: array<u32, 1024>;
     for (var dy = -r; dy <= r; dy++) {
         for (var dx = -r; dx <= r; dx++) {
             let v = vec4<u32>(tex_get_clamped(src, x0 + dx, y + dy));
-            hist[v.x] += 1u;
-            hist[512u + v.y] += 1u;
-            hist[1024u + v.z] += 1u;
-            hist[1536u + v.w] += 1u;
+            for (var c = 0u; c < 4u; c++) {
+                let i = c * 512u + v[c];
+                hist[i >> 1u] += 1u << ((i & 1u) * 16u);
+            }
         }
     }
     // Per channel: the median level and the count of values below it.
@@ -119,11 +122,13 @@ fn fxn_median_huang(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let o = vec4<u32>(tex_get_clamped(src, x - 1 - r, y + dy));
                 let n = vec4<u32>(tex_get_clamped(src, x + r, y + dy));
                 for (var c = 0u; c < 4u; c++) {
-                    hist[c * 512u + o[c]] -= 1u;
+                    let io = c * 512u + o[c];
+                    hist[io >> 1u] -= 1u << ((io & 1u) * 16u);
                     if (o[c] < med[c]) {
                         lt[c] -= 1u;
                     }
-                    hist[c * 512u + n[c]] += 1u;
+                    let i_n = c * 512u + n[c];
+                    hist[i_n >> 1u] += 1u << ((i_n & 1u) * 16u);
                     if (n[c] < med[c]) {
                         lt[c] += 1u;
                     }
@@ -134,10 +139,16 @@ fn fxn_median_huang(@builtin(global_invocation_id) gid: vec3<u32>) {
             let base = c * 512u;
             while (lt[c] > half) {
                 med[c] -= 1u;
-                lt[c] -= hist[base + med[c]];
+                let i = base + med[c];
+                lt[c] -= (hist[i >> 1u] >> ((i & 1u) * 16u)) & 0xffffu;
             }
-            while (lt[c] + hist[base + med[c]] <= half) {
-                lt[c] += hist[base + med[c]];
+            loop {
+                let i = base + med[c];
+                let count = (hist[i >> 1u] >> ((i & 1u) * 16u)) & 0xffffu;
+                if (lt[c] + count > half) {
+                    break;
+                }
+                lt[c] += count;
                 med[c] += 1u;
             }
         }

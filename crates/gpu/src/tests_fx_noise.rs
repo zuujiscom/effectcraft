@@ -237,11 +237,33 @@ fn median_levels_match_cpu_division() {
         // A monotone row's median is its centre, including repeated edges. Exercise both
         // the bisection and sliding-histogram kernels at every quantised level.
         let mut enc = crate::context::Enc::new(&g.ctx);
-        let median = crate::fx_noise::median_image(&mut enc, &input, radius, false);
+        let median = crate::fx_noise::median_image(&mut enc, &input, radius, false).unwrap();
         let actual = enc.download(&median).unwrap();
         for (level, (want, got)) in image.data.iter().zip(&actual.data).enumerate() {
             assert_eq!(got, want, "radius {radius}, level {level}");
         }
+    }
+}
+
+#[test]
+fn median_histogram_counts_reach_the_largest_gpu_radius() {
+    let Some(g) = crate::tests::gpu() else { return };
+    // One level everywhere: every window holds (2r + 1)² = 65025 equal values at r = 127, the
+    // most a packed 16-bit histogram count can be asked to hold. Two neighbouring levels share
+    // a word, so an overflow would also corrupt the other one. Larger radii go to the CPU.
+    let r = crate::fx_noise::MEDIAN_HUANG_MAX_R;
+    for value in [200.0 / 511.0, 201.0 / 511.0] {
+        let mut image = effectcraft_raster::Image::new(300, 3);
+        for pixel in image.data.iter_mut() {
+            *pixel = [value, value, value, 1.0];
+        }
+        let input = g.ctx.upload_image(&image).unwrap();
+        let mut enc = crate::context::Enc::new(&g.ctx);
+        let median = crate::fx_noise::median_image(&mut enc, &input, r, false).unwrap();
+        let actual = enc.download(&median).unwrap();
+        assert!(actual.data.iter().all(|p| *p == [value, value, value, 1.0]), "value {value}");
+        let mut enc = crate::context::Enc::new(&g.ctx);
+        assert!(crate::fx_noise::median_image(&mut enc, &input, r + 1, false).is_none());
     }
 }
 
