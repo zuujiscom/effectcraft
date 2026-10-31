@@ -274,7 +274,7 @@ fn denoise(e: &mut Enc, ctx: &EffectCtx, b: &GBuf) -> Option<GpuImage> {
     let r = ((1.0 + level * 4.0) * b.scale).max(1.0) as usize;
     if pr.e("noiseType") == 1 {
         let mr = ((level * 3.0 * b.scale).round() as usize).max(1);
-        return per_eye(e, &b.img, layout(ctx), |e, img, _| Some(crate::fx_noise::median_image(e, img, mr, false)));
+        return per_eye(e, &b.img, layout(ctx), |e, img, _| crate::fx_noise::median_image(e, img, mr, false));
     }
     let eps = (level * level * 0.02) as f32;
     let detail = (pr.f("detail") / 100.0).clamp(0.0, 1.0) as f32;

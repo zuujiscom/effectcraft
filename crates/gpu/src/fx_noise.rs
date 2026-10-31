@@ -73,6 +73,10 @@ pub(crate) const IDS: &[&str] = &[
 /// not its square.
 pub(crate) const MEDIAN_BISECT_R: usize = 4;
 
+/// Largest radius [`MedianKernel::Private64`] takes: its histogram keeps 16-bit counts, and a
+/// window holds (2r + 1)² of them. Larger radii render on the CPU.
+pub(crate) const MEDIAN_HUANG_MAX_R: usize = 127;
+
 /// Physical GPUs retain the original parallel private histogram. Software Vulkan
 /// uses bounded workgroup storage to avoid its expensive first-use private-array
 /// lowering. This trades some warmed software throughput for bounded first use.
@@ -200,14 +204,18 @@ pub(crate) fn fractal(e: &mut Enc, ctx: &EffectCtx, b: GBuf, turbulent: bool) ->
 
 // ---------------------------------------------------------------- Median family (noise.rs, noise2.rs)
 
-/// noise::median_image (of the straight colour with alpha 1 when `straight`).
-pub(crate) fn median_image(e: &mut Enc, img: &GpuImage, r: usize, straight: bool) -> GpuImage {
+/// noise::median_image (of the straight colour with alpha 1 when `straight`); `None` above
+/// [`MEDIAN_HUANG_MAX_R`] with the private-histogram kernel.
+pub(crate) fn median_image(e: &mut Enc, img: &GpuImage, r: usize, straight: bool) -> Option<GpuImage> {
+    if r > MEDIAN_HUANG_MAX_R && e.g.median_kernel == MedianKernel::Private64 {
+        return None;
+    }
     let q = run(e, "fxn_quant", &with_u0([straight as u32, 0, 0, 0]), img, None, None);
     // Preserve the CPU's rounded level / 511 values before the strict Dust & Scratches
     // threshold. GPU division (even residual-corrected) may differ by one ulp.
     let levels = e.data(&(0..512).map(|level| level as f32 / 511.0).collect::<Vec<_>>());
     if r <= MEDIAN_BISECT_R {
-        return run(e, "fxn_median", &with_u0([r as u32, 0, 0, 0]), &q, None, Some(&levels));
+        return Some(run(e, "fxn_median", &with_u0([r as u32, 0, 0, 0]), &q, None, Some(&levels)));
     }
     // Segments long enough that filling the first window (2r + 1)² costs about as much as
     // sliding along the rest.
@@ -215,7 +223,7 @@ pub(crate) fn median_image(e: &mut Enc, img: &GpuImage, r: usize, straight: bool
     let out = e.scratch(q.width, q.height);
     let groups = (q.height.div_ceil(e.g.median_kernel.rows_per_workgroup()), q.width.div_ceil(seg));
     e.dispatch("fxn_median_huang", &with_u0([r as u32, seg, 0, 0]), crate::context::KernelImages { src: &q, aux: None, out: &out }, Some(&levels), groups);
-    out
+    Some(out)
 }
 
 fn median(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
@@ -231,7 +239,7 @@ fn median(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         "ec.noise.dustscratches" => (1, ctx.params.b("operateOnAlpha"), false),
         _ => (0, ctx.params.b("operateOnAlpha"), false),
     };
-    let m = median_image(e, &b.img, r, straight);
+    let m = median_image(e, &b.img, r, straight)?;
     let mut p = with_u0([mode, on_alpha as u32, 0, 0]);
     if mode == 1 {
         p.f[0][0] = ctx.params.f("threshold") as f32 / 255.0;
